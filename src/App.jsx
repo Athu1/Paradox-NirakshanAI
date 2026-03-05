@@ -282,8 +282,8 @@ function WebcamFeed({ active, cameraId, status, onIncidentDetected, onSituationC
               try {
                 const poses = await moveNetModel.estimatePoses(video);
                 const { score, reason } = analyzePosesForFight(poses, prevPosesRef.current);
-                const alertThreshold = status === 'SUSPICIOUS' ? 50 : 60;
-                const criticalThreshold = status === 'SUSPICIOUS' ? 65 : 80;
+                const alertThreshold = status === 'SUSPICIOUS' ? 82 : 85;
+                const criticalThreshold = status === 'SUSPICIOUS' ? 90 : 94;
                 const isAlert = score >= alertThreshold;
 
                 poses.forEach(pose => drawPose(ctx, pose, isAlert));
@@ -306,10 +306,10 @@ function WebcamFeed({ active, cameraId, status, onIncidentDetected, onSituationC
                   onIncidentDetected({ incidentDetected: true, type: 'Physical Fight', severity, confidence: score, description: `MoveNet — ${reason}` });
                 }
 
-                // ── Auto-clear ───────────────────────────────────────
-                if (score < 20) {
+                // ── Auto-clear — 5s below alert threshold resets to CLEAR ─
+                if (score < alertThreshold) {
                   if (!lowScoreSinceRef.current) lowScoreSinceRef.current = now;
-                  else if (now - lowScoreSinceRef.current > 10000 && onSituationClear) {
+                  else if (now - lowScoreSinceRef.current > 6000 && onSituationClear) {
                     lowScoreSinceRef.current = null;
                     fightCooldownRef.current = 0;
                     onSituationClear(cameraId);
@@ -447,6 +447,170 @@ function WebcamFeed({ active, cameraId, status, onIncidentDetected, onSituationC
 
 
 
+// ─── IP Camera Feed (Proxy + AI Detection) ────────────────────────────────
+// Renders an IP camera stream through the server proxy so JS can read pixels.
+// Runs MoveNet + COCO-SSD on a hidden canvas at ~5fps.
+function IpCameraFeed({ active, cameraId, streamUrl, status, onIncidentDetected, onSituationClear }) {
+  const imgRef = useRef(null);   // <img> showing the proxied MJPEG
+  const canvasRef = useRef(null);   // display canvas with overlays
+  const fightCooldownRef = useRef(0);
+  const lowScoreSinceRef = useRef(null);
+  const objectTrackerRef = useRef(new Map());
+  const intervalRef = useRef(null);
+  const prevPosesRef = useRef(null);
+
+  const proxiedUrl = `${API_BASE}/api/proxy?url=${encodeURIComponent(streamUrl)}`;
+
+  useEffect(() => {
+    if (!active) return;
+
+    const analyzeFrame = async () => {
+      const img = imgRef.current;
+      const canvas = canvasRef.current;
+      if (!img || !canvas || !img.complete || img.naturalWidth === 0) return;
+
+      canvas.width = img.naturalWidth || img.width || 640;
+      canvas.height = img.naturalHeight || img.height || 480;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw the current frame from the <img> to canvas so TF.js can read it
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      const now = Date.now();
+
+      // ── MoveNet ──────────────────────────────────────────────────────────
+      if (moveNetModel) {
+        try {
+          const poses = await moveNetModel.estimatePoses(canvas);
+          const { score, reason } = analyzePosesForFight(poses, prevPosesRef.current);
+          const alertThreshold = status === 'SUSPICIOUS' ? 82 : 85;
+          const criticalThreshold = status === 'SUSPICIOUS' ? 90 : 94;
+          const isAlert = score >= alertThreshold;
+
+          poses.forEach(p => drawPose(ctx, p, isAlert));
+
+          // HUD bar
+          const barW = Math.round((canvas.width - 20) * score / 100);
+          ctx.fillStyle = isAlert ? 'rgba(255,59,48,0.8)' : 'rgba(30,30,50,0.7)';
+          ctx.fillRect(8, canvas.height - 34, canvas.width - 16, 26);
+          ctx.fillStyle = isAlert ? '#ff453a' : '#30d158';
+          ctx.fillRect(10, canvas.height - 32, barW - 4, 22);
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace';
+          ctx.fillText(`FIGHT SCORE: ${score}%  ${isAlert ? '⚠ ALERT' : '● CLEAR'}  (${poses.length} person${poses.length !== 1 ? 's' : ''})`, 14, canvas.height - 16);
+
+          // IP CAMERA badge
+          ctx.fillStyle = 'rgba(10,132,255,0.85)';
+          ctx.fillRect(6, 6, 68, 16);
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 9px monospace';
+          ctx.fillText('📡 IP CAM', 10, 17);
+
+          // Fight trigger
+          if (isAlert && onIncidentDetected && now - fightCooldownRef.current > 15000) {
+            fightCooldownRef.current = now;
+            lowScoreSinceRef.current = null;
+            const severity = score >= criticalThreshold ? 'CRITICAL' : 'SUSPICIOUS';
+            onIncidentDetected({ incidentDetected: true, type: 'Physical Fight', severity, confidence: score, description: `MoveNet — ${reason}` });
+          }
+
+          // Auto-clear — 5s below alert threshold resets to CLEAR
+          if (score < alertThreshold) {
+            if (!lowScoreSinceRef.current) lowScoreSinceRef.current = now;
+            else if (now - lowScoreSinceRef.current > 6000 && onSituationClear) {
+              lowScoreSinceRef.current = null; fightCooldownRef.current = 0;
+              onSituationClear(cameraId);
+            }
+          } else { lowScoreSinceRef.current = null; }
+
+          prevPosesRef.current = poses;
+        } catch { /* ignore inference errors */ }
+      }
+
+      // ── COCO-SSD ─────────────────────────────────────────────────────────
+      if (cocoModel) {
+        try {
+          const objs = await cocoModel.detect(canvas);
+          const tracker = objectTrackerRef.current;
+          const seenKeys = new Set();
+          const dangerCooldowns = tracker._dangerCooldowns || (tracker._dangerCooldowns = {});
+          const personCentroids = (prevPosesRef.current || []).map(p => {
+            const vk = p.keypoints.filter(k => k.score > 0.3);
+            if (!vk.length) return null;
+            return { x: vk.reduce((s, k) => s + k.x, 0) / vk.length, y: vk.reduce((s, k) => s + k.y, 0) / vk.length };
+          }).filter(Boolean);
+
+          objs.forEach(obj => {
+            const isDangerous = DANGEROUS_CLASSES.has(obj.class);
+            const isValuable = TRACKED_CLASSES.has(obj.class);
+            if (!isDangerous && !isValuable) return;
+
+            if (isDangerous && obj.score >= 0.15) {
+              const dangerLabel = DANGER_LABEL[obj.class] || `⚠ ${obj.class.toUpperCase()}`;
+              const [bx, by, bw, bh] = obj.bbox;
+              const pulse = Math.floor(Date.now() / 250) % 2 === 0;
+              ctx.strokeStyle = pulse ? '#ff0000' : '#ff6b6b'; ctx.lineWidth = 4;
+              ctx.strokeRect(bx, by, bw, bh);
+              ctx.fillStyle = pulse ? 'rgba(255,0,0,0.15)' : 'rgba(255,59,48,0.05)';
+              ctx.fillRect(bx, by, bw, bh);
+              const tw = ctx.measureText(dangerLabel).width + 14;
+              ctx.fillStyle = '#ff0000'; ctx.fillRect(bx, by - 24, tw, 24);
+              ctx.fillStyle = '#fff'; ctx.font = 'bold 12px monospace';
+              ctx.fillText(dangerLabel, bx + 6, by - 6);
+              const dkey = `danger_${obj.class}`;
+              if (!dangerCooldowns[dkey] || now - dangerCooldowns[dkey] > 20000) {
+                dangerCooldowns[dkey] = now;
+                if (onIncidentDetected) onIncidentDetected({ incidentDetected: true, type: 'Dangerous Object', severity: 'CRITICAL', confidence: Math.round(obj.score * 100), description: `${dangerLabel} detected at camera ${cameraId}` });
+              }
+              return;
+            }
+
+            if (!isValuable || obj.score < 0.25) return;
+            const displayName = CLASS_LABEL[obj.class] || obj.class.toUpperCase();
+            const [bx, by, bw, bh] = obj.bbox;
+            const key = `${obj.class}_${gridCell(bx, by, bw, bh)}`;
+            seenKeys.add(key);
+            const cx = bx + bw / 2, cy = by + bh / 2;
+            const personNearby = personCentroids.some(p => Math.hypot(p.x - cx, p.y - cy) < 100);
+            if (tracker.has(key)) {
+              const t = tracker.get(key);
+              t.lastSeen = now; t.bbox = obj.bbox;
+              if (personNearby) { t.state = 'HELD'; t.firstSeen = now; t.triggered = false; }
+              else if (t.state !== 'ABANDONED') {
+                const age = now - t.firstSeen;
+                if (age > 30000) {
+                  t.state = 'ABANDONED';
+                  if (!t.triggered && onIncidentDetected) { t.triggered = true; onIncidentDetected({ incidentDetected: true, type: 'Abandoned Object', severity: 'SUSPICIOUS', confidence: Math.round(obj.score * 100), description: `Unattended ${displayName} for ${Math.round(age / 1000)}s at ${cameraId}` }); }
+                } else t.state = 'PENDING';
+              }
+            } else { tracker.set(key, { class: obj.class, bbox: obj.bbox, firstSeen: now, lastSeen: now, state: personNearby ? 'HELD' : 'PENDING', triggered: false }); }
+
+            const t = tracker.get(key);
+            if (t.state !== 'HELD') drawObjectBox(ctx, t.bbox, displayName, t.state, now - t.firstSeen);
+          });
+          for (const [k] of tracker) { if (k !== '_dangerCooldowns' && !seenKeys.has(k)) tracker.delete(k); }
+        } catch { /* ignore */ }
+      }
+    };
+
+    // Run analysis at ~5fps
+    intervalRef.current = setInterval(analyzeFrame, 200);
+
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [active, cameraId, streamUrl, status, onIncidentDetected, onSituationClear]);
+
+  if (!active) return null;
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <img ref={imgRef} src={proxiedUrl} alt={`IP Camera ${cameraId}`} crossOrigin="anonymous"
+        style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000' }} />
+      <canvas ref={canvasRef}
+        style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />
+    </div>
+  );
+}
+
 // ─── Camera Feed Tile ─────────────────────────────────────────────────────
 function CameraTile({ camera, status, incident, onClick, onExpand, isExpanded, onIncidentDetected, onSituationClear }) {
   const cls = status === 'CRITICAL' ? 'critical' : status === 'SUSPICIOUS' ? 'suspicious' : '';
@@ -468,14 +632,28 @@ function CameraTile({ camera, status, incident, onClick, onExpand, isExpanded, o
           <WebcamFeed active={true} cameraId={camera.id} status={status}
             onIncidentDetected={(data) => onIncidentDetected && onIncidentDetected(data, camera.id)}
             onSituationClear={onSituationClear} />
-        ) : (
-          <>
+        ) : camera.streamUrl && camera.streamUrl.trim() !== '' ? (
+          camera.streamUrl.match(/\.(mp4|webm)$/i) ? (
+            // MP4/WebM: native <video> is fine since these are file downloads, not canvas-hostile
+            <video src={camera.streamUrl} autoPlay muted loop playsInline
+              style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000' }} />
+          ) : (
+            // MJPEG / IP Camera stream — use proxy + AI detection canvas
+            <IpCameraFeed active={true} cameraId={camera.id} streamUrl={camera.streamUrl} status={status}
+              onIncidentDetected={(data) => onIncidentDetected && onIncidentDetected(data, camera.id)}
+              onSituationClear={onSituationClear} />
+          )
+        ) : null}
+
+
+        {(!isWebcam && (!camera.streamUrl || camera.streamUrl.trim() === '')) && (
+          <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
             <div className="camera-noise" />
             <div className="camera-feed-placeholder">
               <span className="cam-placeholder-icon">📷</span>
               <span className="cam-placeholder-id">{camera.id}</span>
             </div>
-          </>
+          </div>
         )}
         <div className="camera-rec"><div className="rec-dot" />REC</div>
         <div className={`camera-status-badge ${status}`}>{status}</div>
@@ -615,8 +793,8 @@ const PIPELINE_STEPS = [
 ];
 
 // ─── Incident Modal ───────────────────────────────────────────────────────
-function IncidentModal({ incident, onClose, onResolve, addLog }) {
-  const cam = CAMERAS.find(c => c.id === incident.cameraId) || CAMERAS[0];
+function IncidentModal({ incident, onClose, onResolve, addLog, cameras: allCameras }) {
+  const cam = allCameras.find(c => c.id === incident.cameraId) || allCameras[0] || { id: '?', name: 'Unknown', lat: 0, lon: 0, zone: '', sector: '' };
   const nearestCams = findNearest(cam.lat, cam.lon, CAMERAS.filter(c => c.id !== cam.id), 3)
     .map(c => ({ ...c, distanceM: Math.round(haversineKm(cam.lat, cam.lon, c.lat, c.lon) * 1000) }));
   const nearestSvcs = {
@@ -1255,6 +1433,24 @@ export default function App() {
     addLog(`🚨 AI VISION: [${severity}] ${type} at ${cam.id} — ${cam.name}`, severity === 'CRITICAL' ? 'critical' : 'suspicious');
     addLog(`👁️ ${description.slice(0, 80)}`, 'agent');
     console.log('[Vision] Incident created:', id, 'for camera', cam.id);
+
+    // 🔴 Trigger Twilio SMS + Voice Call for BOTH Suspicious & Critical
+    if (severity === 'CRITICAL' || severity === 'SUSPICIOUS') {
+      addLog(`📳 Dispatching Twilio SMS + Voice call for ${severity} alert…`, 'agent');
+      fetch(`${API_BASE}/api/alert/critical`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, type, cameraId: cam.id, severity, confidence, description, lat: cam.lat, lon: cam.lon }),
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (data.results?.sms) addLog(`✅ SMS sent — SID: ${data.results.sms.sid?.slice(0, 16)}…`, 'clear');
+          if (data.results?.call) addLog(`📞 Voice call initiated — SID: ${data.results.call.sid?.slice(0, 16)}…`, 'clear');
+          if (data.errors?.sms) addLog(`⚠️ SMS failed: ${data.errors.sms}`, 'suspicious');
+          if (data.errors?.call) addLog(`⚠️ Call failed: ${data.errors.call}`, 'suspicious');
+        })
+        .catch(err => addLog(`⚠️ Twilio alert error: ${err.message}`, 'suspicious'));
+    }
   }, [cameras, addLog]);
   const handleSituationClear = useCallback((cameraId) => {
     const cam = cameras.find(c => c.id === cameraId);
@@ -1511,7 +1707,7 @@ export default function App() {
       </div>
 
       {selectedIncident && (
-        <IncidentModal incident={selectedIncident} onClose={() => setSelectedIncident(null)} onResolve={resolveIncident} addLog={addLog} />
+        <IncidentModal incident={selectedIncident} onClose={() => setSelectedIncident(null)} onResolve={resolveIncident} addLog={addLog} cameras={cameras} />
       )}
     </div>
   );

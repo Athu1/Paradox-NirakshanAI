@@ -3,6 +3,7 @@ import cors from 'cors';
 import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { sendSmsAlert, triggerVoiceCall } from './twilioService.js';
 
 // Load .env manually since we keep it simple
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,9 +22,71 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // Twilio sends form-encoded POST bodies
 
 // ─── Health Check ──────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// ─── TwiML Webhook (serves dynamic XML for the voice call) ─────────────────
+// Twilio hits this URL when the person picks up the phone.
+// The incident data is passed as query params from triggerVoiceCall().
+// Twilio POSTs to the webhook URL when making calls — handle both GET and POST
+const twimlHandler = (req, res) => {
+    const params = { ...req.query, ...req.body };
+    const { type = 'Unknown', cameraId = 'UNKNOWN', severity = 'CRITICAL', confidence = '', desc = '' } = params;
+    const speech =
+        `Hello, this is Nirakshan AI. ` +
+        `A ${severity} alert has been triggered. ` +
+        `The system detected a ${type} at camera ${cameraId}` +
+        (confidence ? ` with ${confidence} percent confidence.` : '.') +
+        (desc ? ` ${desc}.` : '') +
+        ` Please review the footage immediately and take appropriate action. ` +
+        `This message will repeat once. ` +
+        `Goodbye.`;
+
+    res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">${speech.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
+  <Pause length="1"/>
+  <Say voice="alice">${speech.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
+</Response>`);
+};
+app.get('/api/twiml', twimlHandler);
+app.post('/api/twiml', twimlHandler);
+
+// ─── Critical Incident Alert (SMS + Voice Call) ─────────────────────────────
+app.post('/api/alert/critical', async (req, res) => {
+    const incident = req.body; // { id, type, cameraId, severity, confidence, description }
+    if (!incident || !incident.type) {
+        return res.status(400).json({ error: 'Invalid incident payload' });
+    }
+
+    const results = {};
+    const errors = {};
+
+    // SMS
+    try {
+        results.sms = await sendSmsAlert(incident);
+    } catch (err) {
+        console.error('[Alert] SMS failed:', err.message);
+        errors.sms = err.message;
+    }
+
+    // Voice call
+    try {
+        results.call = await triggerVoiceCall(incident);
+    } catch (err) {
+        console.error('[Alert] Voice call failed:', err.message);
+        errors.call = err.message;
+    }
+
+    res.json({
+        success: Object.keys(results).length > 0,
+        results,
+        errors: Object.keys(errors).length ? errors : undefined,
+    });
+});
+
 
 // ─── Claude AI Report Generation ───────────────────────────────────────────
 app.post('/api/report', async (req, res) => {
@@ -241,7 +304,82 @@ app.post('/api/pipeline', async (req, res) => {
     res.end();
 });
 
+
+// ─── IP Camera Stream Proxy ─────────────────────────────────────────────────
+// This endpoint proxies any HTTP IP camera stream so the browser can load it
+// same-origin — letting canvas.drawImage() work without CORS taint errors.
+app.get('/api/proxy', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: 'Missing ?url= parameter' });
+
+    // Manual AbortController — AbortSignal.timeout() throws uncaught DOMException in Node 18+
+    const controller = new AbortController();
+    const connectTimeout = setTimeout(() => controller.abort(), 10000);
+
+    let reader = null;
+
+    const cleanup = () => {
+        clearTimeout(connectTimeout);
+        if (reader) reader.cancel().catch(() => { });
+    };
+
+    req.on('close', cleanup);
+
+    try {
+        const camRes = await fetch(url, {
+            headers: { 'User-Agent': 'Nirakshan-Proxy/1.0' },
+            signal: controller.signal,
+        });
+
+        clearTimeout(connectTimeout); // connected — cancel the connect timeout
+
+        const ct = camRes.headers.get('content-type') || 'image/jpeg';
+        res.setHeader('Content-Type', ct);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+
+        reader = camRes.body.getReader();
+
+        const pump = async () => {
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (res.writableEnded) break;
+                    res.write(value);
+                }
+            } catch (pumpErr) {
+                // Swallow abort/cancel errors — expected when client disconnects
+                if (pumpErr.name !== 'AbortError' && pumpErr.name !== 'TypeError') {
+                    console.error('[Proxy] pump error:', pumpErr.message);
+                }
+            } finally {
+                if (!res.writableEnded) res.end();
+                cleanup();
+            }
+        };
+
+        pump(); // fire-and-forget; errors handled inside
+
+    } catch (err) {
+        cleanup();
+        if (err.name === 'AbortError') {
+            if (!res.headersSent) res.status(504).json({ error: 'Camera connection timed out' });
+        } else {
+            if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${err.message}` });
+        }
+    }
+});
+
+// ─── Global safety net (keep server alive) ──────────────────────────────────
+process.on('uncaughtException', (err) => {
+    console.error('[Server] Uncaught exception (safe):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[Server] Unhandled rejection (safe):', reason?.message ?? reason);
+});
+
 app.listen(PORT, () => {
     console.log(`\n🚨 Nirakshan AI Server running on http://localhost:${PORT}`);
-    console.log(`   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY ? '✅ Configured' : '❌ NOT SET — add to server/.env'}\n`);
+    console.log(`__\n`);
 });
